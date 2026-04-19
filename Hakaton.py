@@ -1,12 +1,13 @@
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import os
 import re
 import csv
 from pathlib import Path
 from datetime import datetime
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from functools import lru_cache
 import hashlib
 import json
 from collections import defaultdict
@@ -14,198 +15,68 @@ from collections import defaultdict
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 
-class SmartPersonalDataDetector:
+class FastPersonalDataDetector:
     def __init__(self):
+        # Компилируем регулярки один раз для скорости
         self.patterns = {
-            'snils': re.compile(
-                r'(?:СНИЛС|страховой номер|snils)[:\s]*(\d{3}[\-\s]?\d{3}[\-\s]?\d{3}[\-\s]?\d{2})|\b(\d{3}[\-\s]?\d{3}[\-\s]?\d{3}[\-\s]?\d{2})\b',
-                re.IGNORECASE),
-            'passport': re.compile(r'(?:паспорт|passport|серия|номер)[:\s]*(\d{4}[\-\s]?\d{6})|\b(\d{4}[\-\s]?\d{6})\b',
-                                   re.IGNORECASE),
-            'inn': re.compile(r'(?:ИНН|inn|налогоплательщика)[:\s]*(\d{12})|\b(\d{12})\b', re.IGNORECASE),
-            'phone': re.compile(
-                r'(?:тел|phone|моб|контакт)[:\s]*((?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})',
-                re.IGNORECASE),
+            'snils': re.compile(r'\b\d{3}[\-\s]?\d{3}[\-\s]?\d{3}[\-\s]?\d{2}\b'),
+            'passport': re.compile(r'\b\d{4}[\-\s]?\d{6}\b'),
+            'inn': re.compile(r'\b\d{12}\b'),
+            'phone': re.compile(r'\b(?:8|\+7)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}\b'),
             'email': re.compile(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b'),
-            'fio': re.compile(r'(?:ФИО|Ф\.И\.О|фио|fio)[:\s]*([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)',
-                              re.IGNORECASE)
         }
-
-        self.exclude_patterns = [
-            re.compile(r'\b(?:000|111|222|333|444|555|666|777|888|999)\b'),
-            re.compile(r'\b\d{4}-\d{2}-\d{2}\b'),
-            re.compile(r'\b\d+\.\d+\.\d+\b'),
-            re.compile(r'\b(?:http|https|ftp)://'),
-            re.compile(r'\b[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}\b', re.I),
-        ]
-
-        self.pd_keywords = [
-            'паспорт', 'passport', 'снилс', 'snils', 'инн', 'inn',
-            'телефон', 'phone', 'адрес', 'address', 'фио', 'fio',
-            'персональные данные', 'personal data', 'конфиденциально'
-        ]
-
-    def validate_snils(self, snils_str):
-        try:
-            digits = re.sub(r'[\s\-]', '', snils_str)
-            if len(digits) != 11 or digits == '0' * 11:
-                return False
-
-            control = int(digits[9:11])
-            sum_val = sum(int(digits[i]) * (9 - i) for i in range(9))
-
-            if sum_val < 100:
-                calculated = sum_val
-            elif sum_val == 100 or sum_val == 101:
-                calculated = 0
-            else:
-                calculated = sum_val % 101
-                if calculated == 100:
-                    calculated = 0
-
-            return calculated == control
-        except:
-            return False
-
-    def validate_inn(self, inn_str):
-        try:
-            digits = re.sub(r'\D', '', inn_str)
-            if len(digits) != 12 or digits == '0' * 12:
-                return False
-
-            coeff1 = [7, 2, 4, 10, 3, 5, 9, 4, 6, 8]
-            n1 = sum(int(digits[i]) * coeff1[i] for i in range(10)) % 11 % 10
-
-            coeff2 = [3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]
-            n2 = sum(int(digits[i]) * coeff2[i] for i in range(11)) % 11 % 10
-
-            return n1 == int(digits[10]) and n2 == int(digits[11])
-        except:
-            return False
-
-    def validate_phone(self, phone_str):
-        digits = re.sub(r'\D', '', phone_str)
-
-        if len(digits) not in [11, 10]:
-            return False
-
-        test_patterns = [
-            r'^[0-9]*(?:0{4,}|1{4,}|2{4,}|3{4,}|4{4,}|5{4,}|6{4,}|7{4,}|8{4,}|9{4,})[0-9]*$',
-            r'^[0-9]*(?:0123456789|9876543210|1234567890)[0-9]*$'
-        ]
-
-        for pattern in test_patterns:
-            if re.match(pattern, digits):
-                return False
-
-        if len(digits) == 11:
-            operator_code = digits[1:4]
-            valid_codes = ['900', '901', '902', '903', '904', '905', '906',
-                           '908', '909', '910', '911', '912', '913', '914',
-                           '915', '916', '917', '918', '919', '920', '921',
-                           '922', '923', '924', '925', '926', '927', '928',
-                           '929', '930', '931', '932', '933', '934', '935',
-                           '936', '937', '938', '939', '950', '951', '952',
-                           '953', '954', '955', '956', '957', '958', '959',
-                           '960', '961', '962', '963', '964', '965', '966',
-                           '967', '968', '969', '970', '971', '972', '973',
-                           '974', '975', '976', '977', '978', '979', '980',
-                           '981', '982', '983', '984', '985', '986', '987',
-                           '988', '989', '991', '992', '993', '994', '995',
-                           '996', '997', '998', '999']
-            return operator_code in valid_codes
-
-        return True
-
-    def validate_passport(self, passport_str):
-        digits = re.sub(r'\D', '', passport_str)
-        if len(digits) != 10:
-            return False
-
-        series = digits[:4]
-        number = digits[4:]
-        if series == '0000' or number == '000000':
-            return False
-
-        return True
-
-    def is_in_context(self, text, match):
-        match_pos = text.find(match)
-        if match_pos == -1:
-            return False
-
-        start = max(0, match_pos - 100)
-        end = min(len(text), match_pos + len(match) + 100)
-        context = text[start:end].lower()
-
-        for keyword in self.pd_keywords:
-            if keyword in context:
-                return True
-
-        return False
 
     def has_personal_data(self, text):
         if not text or len(text) < 10:
             return False
 
-        text_lower = text.lower()
-        has_keywords = any(keyword in text_lower for keyword in self.pd_keywords)
+        # Быстрая проверка - ищем хотя бы одну цифру или @
+        if not any(c.isdigit() or c == '@' for c in text[:500]):
+            return False
 
-        found_valid_data = []
+        found = []
+        for name, pattern in self.patterns.items():
+            # Ищем только первые 3 совпадения для скорости
+            matches = pattern.findall(text)
+            if matches:
+                found.append(f"{name}: {matches[:2]}")
 
-        for data_type, pattern in self.patterns.items():
-            matches = pattern.finditer(text)
-
-            for match in matches:
-                value = match.group(1) or match.group(2)
-                if not value:
-                    continue
-
-                is_false_positive = False
-                for exclude_pattern in self.exclude_patterns:
-                    if exclude_pattern.search(value):
-                        is_false_positive = True
-                        break
-
-                if is_false_positive:
-                    continue
-
-                is_valid = False
-                if data_type == 'snils':
-                    is_valid = self.validate_snils(value)
-                elif data_type == 'inn':
-                    is_valid = self.validate_inn(value)
-                elif data_type == 'phone':
-                    is_valid = self.validate_phone(value)
-                elif data_type == 'passport':
-                    is_valid = self.validate_passport(value)
-                elif data_type == 'email':
-                    is_valid = True
-                elif data_type == 'fio':
-                    is_valid = has_keywords
-
-                if not is_valid and data_type in ['snils', 'inn', 'passport', 'phone']:
-                    is_valid = self.is_in_context(text, value)
-
-                if is_valid:
-                    found_valid_data.append({'type': data_type, 'value': value})
-
-        if len(found_valid_data) >= 2:
-            return True
-        elif len(found_valid_data) == 1 and has_keywords:
-            return True
-
-        return False
+        return len(found) > 0
 
 
-class ImprovedFileProcessor:
+class FastImageProcessor:
+    @staticmethod
+    def quick_preprocess(image):
+        """Быстрая предобработка для OCR"""
+        try:
+            # Конвертируем в оттенки серого если нужно
+            if image.mode != 'L':
+                image = image.convert('L')
+
+            # Оптимальное увеличение - 2x вместо 3x
+            if image.width < 1000:
+                new_size = (image.width * 2, image.height * 2)
+                image = image.resize(new_size, Image.Resampling.LANCZOS)
+
+            # Только базовая обработка для скорости
+            enhancer = ImageEnhance.Contrast(image)
+            image = enhancer.enhance(1.5)
+
+            return image
+        except:
+            return image
+
+
+class FileProcessorFast:
     def __init__(self, max_workers=4):
-        self.detector = SmartPersonalDataDetector()
+        self.detector = FastPersonalDataDetector()
+        self.image_processor = FastImageProcessor()
         self.max_workers = max_workers
-        self.cache_file = "ocr_cache_improved.json"
+        self.cache_file = "ocr_cache.json"
         self.cache = self.load_cache()
 
     def load_cache(self):
+        """Загрузка кэша OCR результатов"""
         if os.path.exists(self.cache_file):
             try:
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
@@ -215,8 +86,11 @@ class ImprovedFileProcessor:
         return {}
 
     def save_cache(self):
+        """Сохранение кэша"""
         try:
+            # Ограничиваем размер кэша 1000 записей
             if len(self.cache) > 1000:
+                # Оставляем только последние 1000
                 self.cache = dict(list(self.cache.items())[-1000:])
             with open(self.cache_file, 'w', encoding='utf-8') as f:
                 json.dump(self.cache, f)
@@ -224,208 +98,304 @@ class ImprovedFileProcessor:
             pass
 
     def get_file_hash(self, filepath):
+        """Быстрый хэш файла для кэширования"""
         try:
             with open(filepath, 'rb') as f:
+                # Читаем только первые 64KB для скорости
                 return hashlib.md5(f.read(65536)).hexdigest()
         except:
             return None
 
-    def find_files(self, directory):
+    def find_files_fast(self, directory):
+        """Быстрый поиск файлов с использованием генератора"""
         directory_path = Path(directory)
-        extensions = {'.pdf', '.docx', '.xlsx', '.xls',
-                      '.tif', '.tiff', '.jpg', '.jpeg', '.png'}
 
+        # Расширения в нижнем регистре для быстрого сравнения
+        extensions = {'.pdf', '.docx', '.xlsx', '.tif', '.tiff',
+                      '.jpg', '.jpeg', '.png'}
+
+        # Используем rglob для рекурсивного поиска
         for file_path in directory_path.rglob('*'):
             if file_path.suffix.lower() in extensions:
                 yield file_path
 
-    def extract_text_from_image(self, filepath, lang='rus+eng'):
+    def extract_text_from_image_fast(self, filepath, lang='rus+eng'):
+        """Быстрое извлечение текста из изображений"""
         try:
+            # Проверяем кэш
             file_hash = self.get_file_hash(filepath)
             if file_hash and file_hash in self.cache:
                 return self.cache[file_hash]
 
+            # Оптимизированная обработка
             with Image.open(filepath) as img:
-                if img.mode != 'L':
-                    img = img.convert('L')
+                # Для маленьких изображений не увеличиваем
+                if img.width < 500 or img.height < 500:
+                    processed = self.image_processor.quick_preprocess(img)
+                    config = '--oem 3 --psm 6'  # Только одна конфигурация
+                else:
+                    # Для больших изображений только базовая обработка
+                    processed = img.convert('L') if img.mode != 'L' else img
+                    config = '--oem 3 --psm 6'
 
-                if img.width < 1500:
-                    ratio = 1500 / img.width
-                    new_size = (int(img.width * ratio), int(img.height * ratio))
-                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+                text = pytesseract.image_to_string(processed, lang=lang, config=config)
+                text = re.sub(r'\s+', ' ', text).strip()
 
-                configs = ['--oem 3 --psm 6', '--oem 3 --psm 3']
+                # Сохраняем в кэш
+                if file_hash and len(text) > 50:
+                    self.cache[file_hash] = text
 
-                texts = []
-                for config in configs:
-                    text = pytesseract.image_to_string(img, lang=lang, config=config)
-                    texts.append(text)
+                return text
 
-                best_text = max(texts, key=lambda t: sum(c.isdigit() for c in t))
-                best_text = re.sub(r'\s+', ' ', best_text).strip()
-
-                if file_hash and len(best_text) > 50:
-                    self.cache[file_hash] = best_text
-
-                return best_text
-
-        except:
+        except Exception as e:
             return ""
 
-    def extract_text_from_pdf(self, filepath):
+    def extract_text_from_pdf_fast(self, filepath):
+        """Быстрое извлечение текста из PDF"""
         try:
             import fitz
-            doc = fitz.open(filepath)
-            text_parts = []
 
-            for page_num in range(min(len(doc), 100)):
+            text = ""
+            doc = fitz.open(filepath)
+
+            # Ограничиваем количество страниц для больших PDF
+            max_pages = min(len(doc), 50)  # Максимум 50 страниц
+            pages_processed = 0
+
+            for page_num in range(max_pages):
                 page = doc[page_num]
                 page_text = page.get_text()
 
-                if len(page_text.strip()) < 100:
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                if page_text.strip():
+                    text += page_text[:2000] + " "  # Ограничиваем текст на странице
+                elif pages_processed < 50:  # OCR только для первых 10 страниц
+                    # Уменьшаем разрешение для OCR
+                    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    ocr_text = self.extract_text_from_image(img)
+                    ocr_text = self.extract_text_from_image_fast(img)
                     if ocr_text:
-                        text_parts.append(ocr_text)
-                else:
-                    text_parts.append(page_text)
+                        text += ocr_text[:1000] + " "
+                    pages_processed += 1
 
-                combined = ' '.join(text_parts)
-                if len(combined) > 20000:
+                # Ранний выход если уже нашли данные
+                if len(text) > 5000:
                     break
 
             doc.close()
-            return ' '.join(text_parts)
+            return text[:10000]  # Ограничиваем общий размер текста
 
-        except:
+        except Exception as e:
             return ""
 
-    def extract_text_from_docx(self, filepath):
+    def extract_text_from_docx_fast(self, filepath):
+        """Быстрое извлечение текста из DOCX"""
         try:
             from docx import Document
+
+            text = []
             doc = Document(filepath)
-            text_parts = []
 
-            for para in doc.paragraphs:
-                if para.text.strip():
-                    text_parts.append(para.text)
+            # Быстрый сбор текста
+            for paragraph in doc.paragraphs[:100]:  # Ограничиваем количество параграфов
+                if paragraph.text:
+                    text.append(paragraph.text[:1000])  # Ограничиваем длину параграфа
 
-            for table in doc.tables:
-                for row in table.rows:
-                    row_text = []
-                    for cell in row.cells:
-                        if cell.text.strip():
-                            row_text.append(cell.text.strip())
-                    if row_text:
-                        text_parts.append(' | '.join(row_text))
+            # Проверяем только первые 2 таблицы
+            for table in doc.tables[:10]:
+                for row in table.rows[:100]:  # Ограничиваем строки в таблице
+                    for cell in row.cells[:50]:  # Ограничиваем ячейки
+                        if cell.text:
+                            text.append(cell.text[:200])
 
-            return ' '.join(text_parts)
+            return ' '.join(text)[:5000]
 
-        except:
+        except Exception as e:
             return ""
 
-    def extract_text_from_excel(self, filepath):
+    def extract_text_from_excel_fast(self, filepath):
+        """Быстрое извлечение текста из Excel"""
         try:
             import pandas as pd
-            text_parts = []
 
+            text = []
+            # Читаем только первые 2 листа
             excel_file = pd.ExcelFile(filepath)
-            for sheet_name in excel_file.sheet_names[:10]:
-                df = pd.read_excel(filepath, sheet_name=sheet_name, nrows=1000)
+            for sheet_name in excel_file.sheet_names[:6]:
+                # Читаем только первые 100 строк
+                df = pd.read_excel(filepath, sheet_name=sheet_name, nrows=100)
+                # Конвертируем только строковые столбцы
+                for col in df.select_dtypes(include=['object']).columns:
+                    text.extend(df[col].astype(str).head(50).tolist())
 
-                for col in df.columns:
-                    col_data = df[col].astype(str)
-                    non_empty = col_data[col_data != 'nan']
-                    if not non_empty.empty:
-                        text_parts.append(f"{sheet_name} - {col}: {' '.join(non_empty.head(100))}")
+            return ' '.join(text)[:5000]
 
-            return ' '.join(text_parts)
-
-        except:
+        except Exception as e:
             return ""
 
     def process_file(self, filepath):
+        """Быстрая обработка одного файла"""
         try:
             file_path_obj = Path(filepath)
             file_ext = file_path_obj.suffix.lower()
+            text = ""
 
+            # Выбираем метод в зависимости от расширения
             if file_ext == '.pdf':
-                text = self.extract_text_from_pdf(filepath)
+                text = self.extract_text_from_pdf_fast(filepath)
             elif file_ext == '.docx':
-                text = self.extract_text_from_docx(filepath)
-            elif file_ext in ['.xlsx', '.xls']:
-                text = self.extract_text_from_excel(filepath)
+                text = self.extract_text_from_docx_fast(filepath)
+            elif file_ext == '.xlsx':
+                text = self.extract_text_from_excel_fast(filepath)
             elif file_ext in ['.tif', '.tiff', '.jpg', '.jpeg', '.png']:
-                text = self.extract_text_from_image(filepath)
-            else:
-                return None
+                text = self.extract_text_from_image_fast(filepath)
 
             if text and len(text) > 20:
                 if self.detector.has_personal_data(text):
                     size = os.path.getsize(filepath)
                     mod_time = datetime.fromtimestamp(os.path.getmtime(filepath))
-
                     return {
-                        'size': self.format_size(size),
+                        'size': size,
                         'time': mod_time.strftime("%Y-%m-%d %H:%M:%S"),
-                        'name': file_path_obj.name,
-                        'full_path': str(filepath),
-                        'extension': file_ext
+                        'name': str(file_path_obj.name),
+                        'full_path': str(filepath)
                     }
 
-            return None
+        except Exception as e:
+            pass
+        return None
 
-        except:
-            return None
+    def process_file_wrapper(self, args):
+        """Обертка для многопоточности"""
+        filepath, = args
+        return self.process_file(filepath)
 
-    def format_size(self, size):
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size < 1024.0:
-                return f"{size:.1f} {unit}"
-            size /= 1024.0
-        return f"{size:.1f} TB"
+    def process_directory(self, input_dir, output_csv, max_workers=None):
+        """Быстрая обработка директории с параллелизацией"""
+        print(f"Scanning directory: {input_dir}")
 
-    def process_directory(self, input_dir, output_csv):
-        files = list(self.find_files(input_dir))
+        # Быстрый сбор файлов
+        files = list(self.find_files_fast(input_dir))
+
         if not files:
+            print("No supported files found")
             return
 
         total = len(files)
-        print(f"Found {total} files, processing with {self.max_workers} workers...")
+        print(f"Found {total} files")
+
+        # Используем максимальное количество потоков
+        workers = max_workers or min(self.max_workers, os.cpu_count() or 1)
+        print(f"Using {workers} workers for parallel processing\n")
 
         results = []
         processed = 0
-        found_count = 0
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        # Параллельная обработка с ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # Отправляем все задачи
             futures = {executor.submit(self.process_file, str(f)): f for f in files}
 
             for future in futures:
                 processed += 1
                 result = future.result()
-
                 if result:
                     results.append(result)
-                    found_count += 1
+                    print(f"\n✓ [{processed}/{total}] FOUND PERSONAL DATA in {result['name']}")
+                else:
+                    # Показываем прогресс
+                    if processed % 1 == 0:
+                        print(f"Processed {processed}/{total} files...")
 
-                if processed % 10 == 0 or processed == total:
-                    print(f"Progress: {processed}/{total} files ({found_count} with PD found)")
-
+        # Сохраняем кэш
         self.save_cache()
 
-        if results:
-            with open(output_csv, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=['size', 'time', 'name', 'full_path', 'extension'])
-                writer.writeheader()
-                writer.writerows(results)
+        # Сохраняем результаты
+        with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=['size', 'time', 'name', 'full_path'])
+            writer.writeheader()
+            writer.writerows(results)
 
-        print(f"Done. Processed: {processed}, PD found: {found_count}, Results saved to: {output_csv}")
+        print(f"\n{'=' * 60}")
+        print(f"Results saved to: {output_csv}")
+        print(f"Files with personal data: {len(results)}/{total}")
+        print(f"Time saved: {len(results)} files with personal data found")
+        print(f"{'=' * 60}")
+
+
+# Более быстрая версия с минимальной обработкой
+class UltraFastFileProcessor(FileProcessorFast):
+    def extract_text_from_image_ultrafast(self, filepath, lang='rus+eng'):
+        """Максимально быстрое извлечение текста"""
+        try:
+            # Проверяем кэш
+            file_hash = self.get_file_hash(filepath)
+            if file_hash and file_hash in self.cache:
+                return self.cache[file_hash]
+
+            # Минимальная обработка
+            with Image.open(filepath) as img:
+                # Только конвертация в серый
+                if img.mode != 'L':
+                    img = img.convert('L')
+
+                # Простое распознавание
+                text = pytesseract.image_to_string(img, lang=lang, config='--psm 6')
+                text = text.replace('\n', ' ').strip()
+
+                # Кэшируем только если есть цифры
+                if file_hash and any(c.isdigit() for c in text):
+                    self.cache[file_hash] = text
+
+                return text[:2000]  # Ограничиваем размер
+        except:
+            return ""
+
+    def process_file(self, filepath, lang='rus+eng'):
+        try:
+            # Преобразуем строку в Path объект
+            file_path_obj = Path(filepath)
+            file_ext = file_path_obj.suffix.lower()
+            text = ""
+
+            print(f"  Processing {file_path_obj.name}...")  # Используем Path объект
+
+            if file_ext == '.pdf':
+                text = self.extract_text_from_pdf(filepath)
+            elif file_ext == '.docx':
+                text = self.extract_text_from_docx(filepath)
+            elif file_ext in ['.xls', '.xlsx']:
+                text = self.extract_text_from_excel(filepath)
+            elif file_ext in ['.tif', '.tiff', '.jpg', '.jpeg', '.png']:
+                text = self.extract_text_from_image(filepath, lang)
+
+            if text and len(text.strip()) > 20:
+                print(f"  Text extracted: {len(text)} chars")
+                print(f"  Preview: {text[:200]}...")
+
+                if self.detector.has_personal_data(text):
+                    size, time_str = self.get_file_info(filepath)
+                    return {
+                        'size': size,
+                        'time': time_str,
+                        'name': str(file_path_obj.name),
+                        'full_path': str(filepath),
+                        'text_preview': text[:500]
+                    }
+                else:
+                    print(f"  No personal data patterns found")
+            else:
+                print(f"  Failed to extract text or text too short ({len(text) if text else 0} chars)")
+
+        except Exception as e:
+            print(f"  Error: {e}")
+            import traceback
+            traceback.print_exc()
+        return None
 
 
 if __name__ == "__main__":
     input_dir = sys.argv[1] if len(sys.argv) > 1 else "./"
-    output_csv = sys.argv[2] if len(sys.argv) > 2 else "result_pd.csv"
+    output_csv = sys.argv[2] if len(sys.argv) > 2 else "result.csv"
 
-    processor = ImprovedFileProcessor(max_workers=4)
+    processor = FileProcessorFast(max_workers=4)
     processor.process_directory(input_dir, output_csv)
